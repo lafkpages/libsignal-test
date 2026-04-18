@@ -19,6 +19,7 @@ import { encryptDeviceName } from "./deviceName.ts";
 import {
   Content,
   EnvelopeType,
+  ReceiptType,
   type IAttachmentPointer,
   type IContent,
 } from "./protos.ts";
@@ -61,18 +62,96 @@ function decodeContent(plaintext: Uint8Array): IContent | null {
   }
 }
 
+function fmtTimestamp(ts: unknown): string {
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return "?";
+  return new Date(ts).toISOString();
+}
+
+function describeDataMessage(dm: NonNullable<IContent["dataMessage"]>): string {
+  const parts: string[] = [];
+  if (typeof dm.body === "string")
+    parts.push(`body=${JSON.stringify(dm.body)}`);
+  if (dm.attachments?.length)
+    parts.push(`attachments=${dm.attachments.length}`);
+  if (dm.reaction) {
+    const r = dm.reaction;
+    parts.push(
+      `reaction=${JSON.stringify(r.emoji ?? "")}${r.remove ? "(remove)" : ""}->${fmtTimestamp(r.targetSentTimestamp)}`,
+    );
+  }
+  if (dm.delete)
+    parts.push(`delete->${fmtTimestamp(dm.delete.targetSentTimestamp)}`);
+  if (dm.quote) parts.push(`quote->${fmtTimestamp(dm.quote.id)}`);
+  if (dm.sticker) parts.push("sticker");
+  if (dm.groupV2) parts.push("groupV2");
+  if (dm.payment) parts.push("payment");
+  if (typeof dm.expireTimer === "number" && dm.expireTimer > 0) {
+    parts.push(`expireTimer=${dm.expireTimer}s`);
+  }
+  if (typeof dm.flags === "number" && dm.flags !== 0) {
+    parts.push(`flags=0x${dm.flags.toString(16)}`);
+  }
+  if (typeof dm.timestamp === "number") {
+    parts.push(`ts=${fmtTimestamp(dm.timestamp)}`);
+  }
+  return parts.length ? parts.join(" ") : "(empty)";
+}
+
+function describeSyncMessage(sm: NonNullable<IContent["syncMessage"]>): string {
+  if (sm.sent) {
+    const dest = sm.sent.destinationServiceId ?? "(self)";
+    const ts = fmtTimestamp(sm.sent.timestamp);
+    if (sm.sent.message) {
+      return `sent->${dest} @${ts} { ${describeDataMessage(sm.sent.message)} }`;
+    }
+    if (sm.sent.editMessage?.dataMessage) {
+      return `sent.edit->${dest} @${ts} { ${describeDataMessage(sm.sent.editMessage.dataMessage)} }`;
+    }
+    return `sent->${dest} @${ts} (no message)`;
+  }
+  if (sm.read?.length) {
+    return `read x${sm.read.length} (latest @${fmtTimestamp(sm.read[sm.read.length - 1]?.timestamp)})`;
+  }
+  if (sm.viewed?.length) {
+    return `viewed x${sm.viewed.length}`;
+  }
+  if (sm.contacts) return "contacts (attachment)";
+  if (sm.blocked) return `blocked (acis=${sm.blocked.acis?.length ?? 0})`;
+  if (sm.configuration) return "configuration";
+  if (sm.request) return `request type=${sm.request.type}`;
+  if (sm.fetchLatest) return `fetchLatest type=${sm.fetchLatest.type}`;
+  if (sm.messageRequestResponse) return "messageRequestResponse";
+  if (sm.keys) return "keys";
+  if (sm.viewOnceOpen) return "viewOnceOpen";
+  if (sm.callEvent) return "callEvent";
+  return Object.keys(sm).join(",") || "(empty)";
+}
+
 function describeContent(content: IContent | null, size: number): string {
   if (!content) return `<${size} bytes, failed to decode as Content>`;
-  const keys = Object.keys(content);
   if (content.syncMessage) {
-    const smKeys = Object.keys(content.syncMessage);
-    return `Content{syncMessage:{${smKeys.join(",")}}}`;
+    return `SyncMessage{ ${describeSyncMessage(content.syncMessage)} }`;
   }
-  if (content.dataMessage) return "Content{dataMessage}";
-  if (content.typingMessage) return "Content{typingMessage}";
-  if (content.receiptMessage) return "Content{receiptMessage}";
-  if (content.callMessage) return "Content{callMessage}";
-  return `Content{${keys.join(",")}}`;
+  if (content.dataMessage) {
+    return `DataMessage{ ${describeDataMessage(content.dataMessage)} }`;
+  }
+  if (content.typingMessage) {
+    const t = content.typingMessage;
+    return `TypingMessage{ action=${t.action} @${fmtTimestamp(t.timestamp)} }`;
+  }
+  if (content.receiptMessage) {
+    const r = content.receiptMessage;
+    const typeName = r.type != null ? (ReceiptType[r.type] ?? r.type) : "?";
+    const tss = (r.timestamp ?? []) as Array<number | { toNumber(): number }>;
+    return `ReceiptMessage{ type=${typeName} for=[${tss.map((t) => fmtTimestamp(typeof t === "number" ? t : t.toNumber())).join(",")}] }`;
+  }
+  if (content.callMessage) return "CallMessage";
+  if (content.nullMessage) return "NullMessage";
+  if (content.storyMessage) return "StoryMessage";
+  if (content.editMessage?.dataMessage) {
+    return `EditMessage->${fmtTimestamp(content.editMessage.targetSentTimestamp)} { ${describeDataMessage(content.editMessage.dataMessage)} }`;
+  }
+  return `Content{${Object.keys(content).join(",")}}`;
 }
 
 async function handleContactsSync(

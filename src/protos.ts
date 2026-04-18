@@ -32,3 +32,5 @@ export const EnvelopeType = signalservice.Envelope.Type;
 export type EnvelopeType = signalservice.Envelope.Type;
 export const SyncRequestType = signalservice.SyncMessage.Request.Type;
 export type SyncRequestType = signalservice.SyncMessage.Request.Type;
+export const ReceiptType = signalservice.ReceiptMessage.Type;
+export type ReceiptType = signalservice.ReceiptMessage.Type;
