@@ -1,11 +1,11 @@
 {
   "name": "@luisafk/libsignal-test",
   "version": "0.0.1",
-  "module": "src/link.ts",
+  "module": "src/client.ts",
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run src/link.ts",
+    "start": "bun run src/demo/index.ts",
     "fetch-protos": "bun run scripts/fetch-protos.ts",
     "postinstall": "bun run fetch-protos"
   },

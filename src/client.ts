@@ -1,0 +1,532 @@
+import { Net } from "@signalapp/libsignal-client";
+
+import {
+  connectAuthedChat,
+  generateAccountPassword,
+  generateOneTimePreKeys,
+  generatePreKeys,
+  linkDevice,
+  randomRegistrationId,
+  registerOneTimeKeys,
+  type LinkDeviceRequest,
+} from "./chatApi.ts";
+import { decryptEnvelope, parseEnvelope } from "./decrypt.ts";
+import { encryptDeviceName } from "./deviceName.ts";
+import { Content, type IContent } from "./protos.ts";
+import {
+  ProvisioningCipher,
+  type ProvisionDecryptResult,
+} from "./provisioningCipher.ts";
+import {
+  b64,
+  loadPrivateKey,
+  loadState,
+  saveState,
+  type LinkedState,
+} from "./state.ts";
+import { createStores, type ProtocolStores } from "./stores.ts";
+import { sendSyncRequests } from "./sync.ts";
+
+// ---------- Public types ----------
+
+export type SignalClientConfig = {
+  /** User-Agent string sent on all HTTP/WS requests. */
+  userAgent: string;
+  /** Device name, encrypted and registered with the server on link. */
+  deviceName: string;
+  /** Path to the JSON file holding linked-account state. */
+  stateFile: string;
+  /** Directory holding sessions / identities / pre-keys (one JSON per kind). */
+  storeDir: string;
+  /** libsignal Net environment. Defaults to Production. */
+  env?: Net.Environment;
+};
+
+export type IncomingMessage = {
+  /** Service ID of the sender (sealed-sender unwrapped if applicable). */
+  senderServiceId: string;
+  senderDeviceId: number;
+  /** Server-provided envelope timestamp. */
+  timestamp: number;
+  /** Outer envelope type (Envelope.Type enum). */
+  envelopeType: number;
+  /** Decoded inner Content proto, or null if it failed to decode. */
+  content: IContent | null;
+  /** Raw plaintext bytes (post-padding-strip), or null for receipts. */
+  plaintext: Uint8Array | null;
+  /** True if delivered via sealed sender. */
+  sealedSender: boolean;
+};
+
+export type SignalClientEvents = {
+  /** Successfully decrypted envelope with non-empty plaintext. */
+  message: (msg: IncomingMessage) => void;
+  /** Server-side delivery receipt (envelope type 5). */
+  serverReceipt: (envelope: {
+    timestamp: number;
+    sourceServiceId?: string | undefined;
+    sourceDeviceId?: number | undefined;
+  }) => void;
+  /** Decryption failed; outerType is the envelope type if parseable. */
+  decryptError: (err: unknown, outerType: number | null) => void;
+  /** Server reports the queue of pending messages is drained. */
+  queueEmpty: () => void;
+  /** Authenticated chat connection was interrupted. */
+  interrupted: (err: Error | null) => void;
+  /** Server-side alerts pushed on the auth socket. */
+  alerts: (alerts: string[]) => void;
+};
+
+type Listener<E extends keyof SignalClientEvents> = SignalClientEvents[E];
+
+// ---------- Helpers ----------
+
+function decodeContent(plaintext: Uint8Array): IContent | null {
+  try {
+    const msg = Content.decode(plaintext);
+    return Content.toObject(msg, { longs: Number, defaults: false });
+  } catch {
+    return null;
+  }
+}
+
+function buildQrUrl(
+  address: string,
+  publicKey: Uint8Array,
+  capabilities: string[],
+): string {
+  const pub = Buffer.from(publicKey).toString("base64");
+  const params = new URLSearchParams({
+    uuid: address,
+    pub_key: pub,
+    capabilities: capabilities.join(","),
+  });
+  return `sgnl://linkdevice?${params.toString()}`;
+}
+
+async function awaitProvisioningEnvelope(
+  net: Net.Net,
+  cipher: ProvisioningCipher,
+  onQrUrl: (url: string) => void,
+): Promise<ProvisionDecryptResult> {
+  return await new Promise<ProvisionDecryptResult>((resolve, reject) => {
+    let conn: Net.ProvisioningConnection | undefined;
+    let settled = false;
+
+    const finish = (err: Error | null, value?: ProvisionDecryptResult) => {
+      if (settled) return;
+      settled = true;
+      conn?.disconnect().catch(() => {});
+      if (err) reject(err);
+      else resolve(value!);
+    };
+
+    net
+      .connectProvisioning({
+        onConnectionInterrupted: (err) => {
+          finish(err ?? new Error("Provisioning connection interrupted"));
+        },
+        onReceivedAddress: (address, ack) => {
+          try {
+            const url = buildQrUrl(address, cipher.publicKey.serialize(), []);
+            onQrUrl(url);
+            ack.send(200);
+          } catch (e) {
+            finish(e as Error);
+          }
+        },
+        onReceivedEnvelope: (envelope, ack) => {
+          try {
+            const msg = cipher.decrypt(envelope);
+            ack.send(200);
+            finish(null, msg);
+          } catch (e) {
+            finish(e as Error);
+          }
+        },
+      })
+      .then((c) => {
+        conn = c;
+      })
+      .catch((e) => finish(e as Error));
+  });
+}
+
+// ---------- SignalClient ----------
+
+/**
+ * High-level wrapper around the libsignal chat / provisioning APIs.
+ *
+ * Usage:
+ *   const client = new SignalClient(cfg);
+ *   if (!client.isLinked()) await client.link({ onQrUrl: console.log });
+ *   client.on("message", (m) => ...);
+ *   await client.connect();
+ *
+ * The class is intentionally small: it owns the state file, the protocol
+ * stores, and the authenticated chat connection. Higher-level concerns
+ * (QR rendering, contact-attachment download, message dispatch) live in
+ * the caller.
+ */
+export class SignalClient {
+  readonly config: SignalClientConfig;
+  readonly net: Net.Net;
+
+  private state: LinkedState | undefined;
+  private stores: ProtocolStores | undefined;
+  private authChat: Net.AuthenticatedChatConnection | undefined;
+
+  private readonly listeners: {
+    [K in keyof SignalClientEvents]: Set<Listener<K>>;
+  } = {
+    message: new Set(),
+    serverReceipt: new Set(),
+    decryptError: new Set(),
+    queueEmpty: new Set(),
+    interrupted: new Set(),
+    alerts: new Set(),
+  };
+
+  constructor(config: SignalClientConfig) {
+    this.config = config;
+    this.net = new Net.Net({
+      env: config.env ?? Net.Environment.Production,
+      userAgent: config.userAgent,
+    });
+    this.state = loadState(config.stateFile);
+    if (this.state) {
+      const identityPrivate = loadPrivateKey(this.state.aciIdentityPrivate);
+      this.stores = createStores(
+        identityPrivate,
+        this.state.registrationId,
+        config.storeDir,
+      );
+    }
+  }
+
+  // ---- Accessors ----
+
+  isLinked(): boolean {
+    return this.state !== undefined;
+  }
+
+  /** Throws if not linked yet. */
+  get linkedState(): LinkedState {
+    if (!this.state) throw new Error("SignalClient is not linked");
+    return this.state;
+  }
+
+  get aci(): string {
+    return this.linkedState.aci;
+  }
+
+  get deviceId(): number {
+    return this.linkedState.deviceId;
+  }
+
+  get protocolStores(): ProtocolStores {
+    if (!this.stores) throw new Error("SignalClient is not linked");
+    return this.stores;
+  }
+
+  // ---- Event subscription ----
+
+  on<E extends keyof SignalClientEvents>(
+    event: E,
+    listener: Listener<E>,
+  ): () => void {
+    this.listeners[event].add(listener);
+    return () => this.off(event, listener);
+  }
+
+  off<E extends keyof SignalClientEvents>(
+    event: E,
+    listener: Listener<E>,
+  ): void {
+    this.listeners[event].delete(listener);
+  }
+
+  private emit<E extends keyof SignalClientEvents>(
+    event: E,
+    ...args: Parameters<Listener<E>>
+  ): void {
+    for (const l of this.listeners[event]) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (l as (...a: any[]) => void)(...args);
+      } catch (e) {
+        console.error(`SignalClient listener for "${event}" threw:`, e);
+      }
+    }
+  }
+
+  // ---- Linking ----
+
+  /**
+   * Runs the QR provisioning flow and registers a new linked device.
+   * On success, persists state to `stateFile` and sets up protocol stores.
+   * Throws if the client is already linked.
+   */
+  async link(opts: {
+    onQrUrl: (url: string) => void;
+    /** Number of one-time EC + Kyber pre-keys to upload per identity. */
+    oneTimePreKeyCount?: number;
+  }): Promise<LinkedState> {
+    if (this.state) throw new Error("Already linked");
+
+    const cipher = new ProvisioningCipher();
+    const msg = await awaitProvisioningEnvelope(this.net, cipher, opts.onQrUrl);
+
+    if (!msg.number) throw new Error("ProvisionMessage missing number");
+    if (!msg.provisioningCode)
+      throw new Error("ProvisionMessage missing provisioningCode");
+    if (!msg.pniKeyPair)
+      throw new Error("ProvisionMessage missing pni identity key");
+
+    const password = generateAccountPassword();
+    const registrationId = randomRegistrationId();
+    const pniRegistrationId = randomRegistrationId();
+
+    const aciKeys = generatePreKeys(msg.aciKeyPair);
+    const pniKeys = generatePreKeys(msg.pniKeyPair);
+
+    const encryptedName = encryptDeviceName(
+      this.config.deviceName,
+      msg.aciKeyPair.publicKey,
+    );
+
+    const body: LinkDeviceRequest = {
+      verificationCode: msg.provisioningCode,
+      accountAttributes: {
+        fetchesMessages: true,
+        name: encryptedName,
+        registrationId,
+        pniRegistrationId,
+        capabilities: { attachmentBackfill: true, spqr: true },
+      },
+      aciSignedPreKey: aciKeys.signedPreKey,
+      pniSignedPreKey: pniKeys.signedPreKey,
+      aciPqLastResortPreKey: aciKeys.pqLastResortPreKey,
+      pniPqLastResortPreKey: pniKeys.pqLastResortPreKey,
+    };
+
+    const result = await linkDevice(
+      this.net,
+      msg.number,
+      password,
+      body,
+      this.config.userAgent,
+    );
+
+    // Build stores immediately so we can persist pre-key private halves
+    // alongside the upload below.
+    const stores = createStores(
+      msg.aciKeyPair.privateKey,
+      registrationId,
+      this.config.storeDir,
+    );
+    stores.signedPreKey.add(
+      aciKeys.signedPreKeyId,
+      Date.now(),
+      aciKeys.signedPreKeyPrivate,
+      Buffer.from(aciKeys.signedPreKey.signature, "base64"),
+    );
+    stores.kyberPreKey.add(
+      aciKeys.pqLastResortPreKeyId,
+      Date.now(),
+      aciKeys.pqLastResortPreKeyPrivate,
+      Buffer.from(aciKeys.pqLastResortPreKey.signature, "base64"),
+    );
+
+    const count = opts.oneTimePreKeyCount ?? 100;
+    const aciOneTime = generateOneTimePreKeys(msg.aciKeyPair, count);
+    const pniOneTime = generateOneTimePreKeys(msg.pniKeyPair, count);
+
+    for (const k of aciOneTime.preKeyPrivates) {
+      stores.preKey.add(k.keyId, k.privateKey);
+    }
+    for (const k of aciOneTime.pqPreKeyPrivates) {
+      // One-time Kyber pre-key signatures are only needed sender-side.
+      stores.kyberPreKey.add(k.keyId, Date.now(), k.keyPair, new Uint8Array());
+    }
+
+    // We need an authenticated chat to upload one-time pre-keys. Open it
+    // *without* registering our incoming-message handler — the connect()
+    // method will reopen with the handler attached.
+    const tempChat = await connectAuthedChat(
+      this.net,
+      result.uuid,
+      result.deviceId,
+      password,
+      () => {
+        /* drop incoming until connect() is called */
+      },
+    );
+    try {
+      await registerOneTimeKeys(
+        tempChat,
+        "aci",
+        { preKeys: aciOneTime.preKeys, pqPreKeys: aciOneTime.pqPreKeys },
+        this.config.userAgent,
+      );
+      await registerOneTimeKeys(
+        tempChat,
+        "pni",
+        { preKeys: pniOneTime.preKeys, pqPreKeys: pniOneTime.pqPreKeys },
+        this.config.userAgent,
+      );
+    } finally {
+      await tempChat.disconnect();
+    }
+
+    const state: LinkedState = {
+      aci: result.uuid,
+      pni: msg.pni,
+      number: msg.number,
+      deviceId: result.deviceId,
+      password,
+      registrationId,
+      pniRegistrationId,
+      userAgent: msg.userAgent,
+      readReceipts: msg.readReceipts ?? false,
+
+      aciIdentityPrivate: b64(msg.aciKeyPair.privateKey.serialize()),
+      pniIdentityPrivate: b64(msg.pniKeyPair.privateKey.serialize()),
+
+      profileKey: msg.profileKey ? b64(msg.profileKey) : undefined,
+      masterKey: msg.masterKey ? b64(msg.masterKey) : undefined,
+      accountEntropyPool: msg.accountEntropyPool,
+      ephemeralBackupKey: msg.ephemeralBackupKey
+        ? b64(msg.ephemeralBackupKey)
+        : undefined,
+      mediaRootBackupKey: msg.mediaRootBackupKey
+        ? b64(msg.mediaRootBackupKey)
+        : undefined,
+    };
+    saveState(this.config.stateFile, state);
+
+    this.state = state;
+    this.stores = stores;
+    return state;
+  }
+
+  /** Raw ProvisionMessage from the most recent successful link, if any. */
+  // (We deliberately don't keep this — callers should rely on `linkedState`
+  // and the on-disk store for everything we need post-link.)
+
+  // ---- Authenticated connection ----
+
+  /**
+   * Opens the authenticated chat connection and starts dispatching incoming
+   * envelopes via events. Idempotent: returns immediately if already
+   * connected. Throws if the client is not linked.
+   */
+  async connect(): Promise<void> {
+    if (this.authChat) return;
+    if (!this.state || !this.stores) {
+      throw new Error("connect() called before link()");
+    }
+    const { aci, deviceId, password } = this.state;
+
+    this.authChat = await this.net.connectAuthenticatedChat(
+      `${aci}.${deviceId}`,
+      password,
+      /* receiveStories */ false,
+      {
+        onConnectionInterrupted: (err) => {
+          this.emit("interrupted", err ?? null);
+        },
+        onIncomingMessage: (envelope, _timestamp, ack) => {
+          // Decrypt asynchronously, but ack only after we've at least
+          // attempted decryption — so a flaky listener doesn't cause us to
+          // permanently lose the envelope.
+          void this.handleIncoming(envelope).finally(() => {
+            ack.send(200);
+          });
+        },
+        onQueueEmpty: () => this.emit("queueEmpty"),
+        onReceivedAlerts: (alerts) => {
+          if (alerts.length > 0) this.emit("alerts", alerts);
+        },
+      },
+    );
+  }
+
+  /** Closes the authenticated chat connection if open. */
+  async disconnect(): Promise<void> {
+    const chat = this.authChat;
+    this.authChat = undefined;
+    if (chat) await chat.disconnect();
+  }
+
+  /** Returns the underlying authenticated chat connection (must be connected). */
+  get chat(): Net.AuthenticatedChatConnection {
+    if (!this.authChat) throw new Error("SignalClient is not connected");
+    return this.authChat;
+  }
+
+  // ---- Sync helpers ----
+
+  /**
+   * Sends SyncMessage.Request for CONTACTS / CONFIGURATION / BLOCKED to
+   * every other device on this account. Replies arrive as `message` events.
+   */
+  async requestSync(): Promise<void> {
+    await sendSyncRequests(
+      this.chat,
+      this.protocolStores,
+      this.aci,
+      this.deviceId,
+      this.config.userAgent,
+    );
+  }
+
+  // ---- Internals ----
+
+  private async handleIncoming(envelopeBytes: Uint8Array): Promise<void> {
+    const stores = this.stores;
+    if (!stores) return; // shouldn't happen post-link
+    try {
+      const result = await decryptEnvelope(
+        envelopeBytes,
+        stores,
+        this.aci,
+        this.deviceId,
+      );
+      if (!result.plaintext) {
+        // Server delivery receipts have no plaintext.
+        this.emit("serverReceipt", {
+          timestamp: result.envelope.timestamp,
+          sourceServiceId: result.envelope.sourceServiceId,
+          sourceDeviceId: result.envelope.sourceDeviceId,
+        });
+        return;
+      }
+      const senderServiceId =
+        result.sealedSender?.senderUuid ??
+        result.envelope.sourceServiceId ??
+        "";
+      const senderDeviceId =
+        result.sealedSender?.senderDeviceId ??
+        result.envelope.sourceDeviceId ??
+        0;
+      this.emit("message", {
+        senderServiceId,
+        senderDeviceId,
+        timestamp: result.envelope.timestamp,
+        envelopeType: result.envelope.type,
+        content: decodeContent(result.plaintext),
+        plaintext: result.plaintext,
+        sealedSender: result.sealedSender !== undefined,
+      });
+    } catch (e) {
+      let outerType: number | null = null;
+      try {
+        outerType = parseEnvelope(envelopeBytes).type;
+      } catch {
+        /* ignore */
+      }
+      this.emit("decryptError", e, outerType);
+    }
+  }
+}
