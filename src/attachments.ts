@@ -24,8 +24,7 @@ import {
   createHmac,
   timingSafeEqual,
 } from "node:crypto";
-
-import { SIGNAL_CA_PEM } from "./signalCa.ts";
+import { SIGNAL_CA_PEM } from "./config";
 
 // Structural superset of generated `signalservice.IAttachmentPointer` — accepts
 // the same nullable fields plus a few extra shapes for cdnId (Long, bigint,
@@ -134,12 +133,16 @@ export async function fetchAndDecryptAttachment(
 ): Promise<Uint8Array> {
   const blob = await downloadAttachment(ptr, userAgent);
   const padded = decryptAttachment(blob, ptr);
-  if (
-    typeof ptr.size === "number" &&
-    ptr.size >= 0 &&
-    ptr.size < padded.length
-  ) {
-    return padded.subarray(0, ptr.size);
+
+  if (typeof ptr.size !== "number" || ptr.size < 0) {
+    throw new Error("AttachmentPointer.size is required");
   }
-  return padded;
+
+  if (ptr.size > padded.length) {
+    throw new Error(
+      `AttachmentPointer.size (${ptr.size}) exceeds decrypted length (${padded.length})`,
+    );
+  }
+
+  return padded.subarray(0, ptr.size);
 }
