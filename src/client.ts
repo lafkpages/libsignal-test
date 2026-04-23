@@ -6,6 +6,7 @@ import type { ProtocolStores } from "./stores.ts";
 
 import { Net } from "@signalapp/libsignal-client";
 
+import { version } from "../package.json";
 import {
   connectAuthedChat,
   generateAccountPassword,
@@ -32,18 +33,24 @@ import { sendSyncRequests } from "./sync.ts";
 
 // ---------- Public types ----------
 
-export type SignalClientConfig = {
-  /** User-Agent string sent on all HTTP/WS requests. */
-  userAgent: string;
+export interface SignalClientConfig {
+  /** User-Agent string sent on all HTTP/WS requests.
+   * @default `@luisafk/signal-client v${version}`
+   */
+  userAgent?: string;
+
   /** Device name, encrypted and registered with the server on link. */
-  deviceName: string;
+  readonly deviceName: string;
+
   /** Path to the JSON file holding linked-account state. */
-  stateFile: string;
+  readonly stateFile: string;
+
   /** Directory holding sessions / identities / pre-keys (one JSON per kind). */
-  storeDir: string;
+  readonly storeDir: string;
+
   /** libsignal Net environment. Defaults to Production. */
-  env?: Net.Environment;
-};
+  readonly env?: Net.Environment;
+}
 
 export type IncomingMessage = {
   /** Service ID of the sender (sealed-sender unwrapped if applicable). */
@@ -184,7 +191,7 @@ async function awaitProvisioningEnvelope(
  * the caller.
  */
 export class SignalClient {
-  readonly config: SignalClientConfig;
+  readonly config: Required<SignalClientConfig>;
   readonly net: Net.Net;
 
   private state: LinkedState | undefined;
@@ -204,19 +211,27 @@ export class SignalClient {
   };
 
   constructor(config: SignalClientConfig) {
-    this.config = config;
+    this.config = {
+      userAgent: `@luisafk/signal-client v${version}`,
+      env: Net.Environment.Production,
+      ...config,
+    };
+
     this.net = new Net.Net({
-      env: config.env ?? Net.Environment.Production,
-      userAgent: config.userAgent,
+      env: this.config.env,
+      userAgent: this.config.userAgent,
     });
-    this.state = loadState(config.stateFile);
+
+    this.state = loadState(this.config.stateFile);
+
     if (this.state) {
       const identityPrivate = loadPrivateKey(this.state.aciIdentityPrivate);
       this.stores = createStores(
         identityPrivate,
         this.state.registrationId,
-        config.storeDir,
+        this.config.storeDir,
       );
+
       // State files written before key-id counters were introduced won't
       // have `keyIds`. Seed the counters from what's already in the store
       // (ACI side) / random (PNI side) so future key generations can't
@@ -236,7 +251,7 @@ export class SignalClient {
           signedPreKeyIdPni: randomInitialKeyId(),
           kyberPreKeyIdPni: randomInitialKeyId(),
         };
-        saveState(config.stateFile, this.state);
+        saveState(this.config.stateFile, this.state);
       }
     }
   }

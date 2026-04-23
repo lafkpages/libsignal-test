@@ -1,8 +1,9 @@
 {
   "name": "@luisafk/signal-client",
   "version": "0.0.1",
-  "module": "src/client.ts",
   "type": "module",
+  "module": "src/client.ts",
+  "types": "src/client.ts",
   "private": true,
   "scripts": {
     "fetch-config": "bun run scripts/fetch-config.ts",

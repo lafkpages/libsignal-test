@@ -11,10 +11,9 @@
  */
 "";
 
+import { $, CryptoHasher, file } from "bun";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
-
-import { $, CryptoHasher, file } from "bun";
 
 // See https://u.luisafk.dev/kFAde
 $.throws(true).env({

@@ -8,18 +8,15 @@
 //
 // Once connected we print incoming envelopes (decrypted) in a human-readable
 // form and download any SyncMessage.Contacts attachment we receive.
-import type { IncomingMessage } from "../client.ts";
 import type { IAttachmentPointer, IContent } from "../protos.ts";
 
 import qrcode from "qrcode-terminal";
 
-import { version } from "../../package.json";
 import { fetchAndDecryptAttachment } from "../attachments.ts";
 import { SignalClient } from "../client.ts";
 import { parseContactDetailsStream } from "../contacts.ts";
 import { EnvelopeType, ReceiptType } from "../protos.ts";
 
-const USER_AGENT = `@luisafk/signal-client/${version}`;
 const DEVICE_NAME = `@luisafk/signal-client`;
 const STATE_FILE = "state.json";
 const STORE_DIR = "store";
@@ -132,6 +129,7 @@ function describeContent(content: IContent | null, size: number): string {
 async function handleContactsSync(
   ptr: IAttachmentPointer,
   complete: boolean,
+  userAgent: string,
 ): Promise<void> {
   if (!ptr.cdnKey && (ptr.cdnId === undefined || ptr.cdnId === null)) {
     console.log("SyncMessage.Contacts: empty pointer; nothing to download.");
@@ -142,7 +140,7 @@ async function handleContactsSync(
     `SyncMessage.Contacts: downloading attachment (cdn=${ptr.cdnNumber ?? 0}, size=${ptr.size ?? "?"}, complete=${complete})...`,
   );
 
-  const plaintext = await fetchAndDecryptAttachment(ptr, USER_AGENT);
+  const plaintext = await fetchAndDecryptAttachment(ptr, userAgent);
   const contacts = parseContactDetailsStream(plaintext);
 
   console.log("SyncMessage.Contacts: parsed", contacts.length, "contacts:");
@@ -152,20 +150,6 @@ async function handleContactsSync(
     const name = c.name ? ` "${c.name}"` : "";
     const avatar = c.avatar ? ` +avatar(${c.avatar.bytes.length}B)` : "";
     console.log(`  - ${id}${name}${avatar}`);
-  }
-}
-
-function logIncoming(m: IncomingMessage): void {
-  const from = `${m.senderServiceId}.${m.senderDeviceId}`;
-  console.log(
-    `Envelope type=${m.envelopeType} from ${from}:`,
-    describeContent(m.content, m.plaintext?.byteLength ?? 0),
-  );
-  const contacts = m.content?.syncMessage?.contacts;
-  if (contacts?.blob) {
-    void handleContactsSync(contacts.blob, contacts.complete ?? false).catch(
-      (e) => console.error("Contacts sync handling failed:", e),
-    );
   }
 }
 
@@ -185,20 +169,36 @@ async function main(): Promise<void> {
 
 async function runMain(): Promise<void> {
   const client = new SignalClient({
-    userAgent: USER_AGENT,
     deviceName: DEVICE_NAME,
     stateFile: STATE_FILE,
     storeDir: STORE_DIR,
   });
 
   // Wire up event listeners *before* we connect, so we don't miss anything.
-  client.on("message", logIncoming);
-  client.on("serverReceipt", (env) => {
-    const from = env.sourceServiceId
-      ? `${env.sourceServiceId}.${env.sourceDeviceId}`
+  client.on("message", (m) => {
+    console.log(
+      `Envelope type=${m.envelopeType} from ${m.senderServiceId}.${m.senderDeviceId}:`,
+      describeContent(m.content, m.plaintext?.byteLength ?? 0),
+    );
+
+    const contacts = m.content?.syncMessage?.contacts;
+
+    if (contacts?.blob) {
+      void handleContactsSync(
+        contacts.blob,
+        contacts.complete ?? false,
+        client.config.userAgent,
+      ).catch((e) => console.error("Contacts sync handling failed:", e));
+    }
+  });
+
+  client.on("serverReceipt", ({ sourceServiceId, sourceDeviceId }) => {
+    const from = sourceServiceId
+      ? `${sourceServiceId}.${sourceDeviceId}`
       : "unknown";
     console.log(`Server delivery receipt for ${from}`);
   });
+
   client.on("decryptError", (err, outerType) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
@@ -206,14 +206,26 @@ async function runMain(): Promise<void> {
       outerType === EnvelopeType.SERVER_DELIVERY_RECEIPT ? "(receipt)" : "",
     );
   });
+
   client.on("queueEmpty", () => console.log("Auth chat: queue empty"));
+
   client.on("interrupted", (err) => {
     if (err) console.error("Auth chat interrupted:", err);
   });
+
   client.on("alerts", (alerts) => console.log("Server alerts:", alerts));
 
-  if (!client.isLinked()) {
+  if (client.isLinked()) {
+    console.log(
+      `Found existing state for ${client.aci} (device ${client.deviceId}); reconnecting...`,
+    );
+
+    await client.connect();
+
+    console.log("Reconnected.");
+  } else {
     console.log("Opening provisioning connection...");
+
     const state = await client.link({
       onQrUrl: (url) => {
         console.log("\nScan this QR with the Signal mobile app:");
@@ -222,6 +234,7 @@ async function runMain(): Promise<void> {
         console.log("\nRaw URL (if scanning fails):", url, "\n");
       },
     });
+
     console.log("Linked!", {
       aci: state.aci,
       pni: state.pni,
@@ -233,22 +246,17 @@ async function runMain(): Promise<void> {
 
     try {
       await client.requestSync();
+
       console.log(
         "Sync requests sent. Primary device will reply via incoming envelopes.",
       );
     } catch (e) {
       console.error("requestSync failed:", e);
     }
-  } else {
-    console.log(
-      `Found existing state for ${client.aci} (device ${client.deviceId}); reconnecting...`,
-    );
-    await client.connect();
-    console.log("Reconnected.");
   }
 
   console.log("Listening for incoming envelopes. Ctrl+C to quit.");
-  await new Promise<void>(() => {
+  await new Promise(() => {
     /* never resolves */
   });
 }
