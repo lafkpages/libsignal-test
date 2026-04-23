@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 import { PrivateKey } from "@signalapp/libsignal-client";
+
+import { decryptBlob, encryptBlob } from "./crypto.ts";
 
 // Persisted state for the "resume" path in link.ts. Only the fields needed to
 // reopen an authenticated chat connection live here — per-identity prekeys
@@ -52,18 +54,33 @@ export type LinkedState = {
   keyIds: KeyIdCounters;
 };
 
-export function saveState(path: string, state: LinkedState): void {
-  writeFileSync(path, JSON.stringify(state, null, 2), { mode: 0o600 });
+export function saveState(
+  path: string,
+  state: LinkedState,
+  key: Uint8Array,
+): void {
+  const plaintext = Buffer.from(JSON.stringify(state, null, 2), "utf8");
+  const envelope = encryptBlob(plaintext, key);
+  const tmp = path + ".tmp";
+  writeFileSync(tmp, envelope, { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 /**
- * Loads state from disk. For state files written before key-id counters were
- * introduced, `keyIds` will be missing; callers are expected to initialize it
- * (see `SignalClient`'s constructor) and persist again.
+ * Loads state from disk, decrypting it with `key`.
+ *
+ * For state files written before key-id counters were introduced, `keyIds`
+ * will be missing; callers are expected to initialize it (see `SignalClient`'s
+ * `init` method) and persist again.
  */
-export function loadState(path: string): LinkedState | undefined {
+export function loadState(
+  path: string,
+  key: Uint8Array,
+): LinkedState | undefined {
   if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8")) as LinkedState;
+  const raw = readFileSync(path);
+  const decrypted = decryptBlob(new Uint8Array(raw), key);
+  return JSON.parse(Buffer.from(decrypted).toString("utf8")) as LinkedState;
 }
 
 export function b64(bytes: Uint8Array): string {

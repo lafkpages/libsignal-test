@@ -16,6 +16,7 @@ import {
   randomRegistrationId,
   registerOneTimeKeys,
 } from "./chatApi.ts";
+import { getOrCreateMasterKey } from "./crypto.ts";
 import { decryptEnvelope, parseEnvelope } from "./decrypt.ts";
 import { encryptDeviceName } from "./deviceName.ts";
 import { Content } from "./protos.ts";
@@ -197,6 +198,7 @@ export class SignalClient {
   private state: LinkedState | undefined;
   private stores: ProtocolStores | undefined;
   private authChat: Net.AuthenticatedChatConnection | undefined;
+  private masterKey: Uint8Array | undefined;
 
   private readonly listeners: {
     [K in keyof SignalClientEvents]: Set<Listener<K>>;
@@ -221,14 +223,26 @@ export class SignalClient {
       env: this.config.env,
       userAgent: this.config.userAgent,
     });
+  }
 
-    this.state = loadState(this.config.stateFile);
+  /**
+   * Loads the master encryption key from the OS credential store (creating
+   * one on first use) and reads any existing persisted state + protocol
+   * stores from disk. Must be called once before {@link isLinked},
+   * {@link link}, or {@link connect}.
+   */
+  async init(): Promise<void> {
+    if (this.masterKey) return;
+    this.masterKey = await getOrCreateMasterKey();
+
+    this.state = loadState(this.config.stateFile, this.masterKey);
 
     if (this.state) {
       const identityPrivate = loadPrivateKey(this.state.aciIdentityPrivate);
       this.stores = createStores(
         identityPrivate,
         this.state.registrationId,
+        this.masterKey,
         this.config.storeDir,
       );
 
@@ -251,14 +265,22 @@ export class SignalClient {
           signedPreKeyIdPni: randomInitialKeyId(),
           kyberPreKeyIdPni: randomInitialKeyId(),
         };
-        saveState(this.config.stateFile, this.state);
+        saveState(this.config.stateFile, this.state, this.masterKey);
       }
     }
+  }
+
+  private requireMasterKey(): Uint8Array {
+    if (!this.masterKey) {
+      throw new Error("SignalClient.init() must be called before use");
+    }
+    return this.masterKey;
   }
 
   // ---- Accessors ----
 
   isLinked(): boolean {
+    this.requireMasterKey();
     return this.state !== undefined;
   }
 
@@ -324,6 +346,7 @@ export class SignalClient {
     /** Number of one-time EC + Kyber pre-keys to upload per identity. */
     oneTimePreKeyCount?: number;
   }): Promise<LinkedState> {
+    const masterKey = this.requireMasterKey();
     if (this.state) throw new Error("Already linked");
 
     const cipher = new ProvisioningCipher();
@@ -405,6 +428,7 @@ export class SignalClient {
     const stores = createStores(
       msg.aciKeyPair.privateKey,
       registrationId,
+      masterKey,
       this.config.storeDir,
     );
     stores.signedPreKey.add(
@@ -521,7 +545,7 @@ export class SignalClient {
 
       keyIds,
     };
-    saveState(this.config.stateFile, state);
+    saveState(this.config.stateFile, state, masterKey);
 
     this.state = state;
     this.stores = stores;

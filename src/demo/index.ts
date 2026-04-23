@@ -18,7 +18,7 @@ import { parseContactDetailsStream } from "../contacts.ts";
 import { EnvelopeType, ReceiptType } from "../protos.ts";
 
 const DEVICE_NAME = `@luisafk/signal-client`;
-const STATE_FILE = "state.json";
+const STATE_FILE = "state.enc";
 const STORE_DIR = "store";
 
 // ---------- Pretty-printing helpers ----------
@@ -173,6 +173,8 @@ async function runMain(): Promise<void> {
     stateFile: STATE_FILE,
     storeDir: STORE_DIR,
   });
+
+  await client.init();
 
   // Wire up event listeners *before* we connect, so we don't miss anything.
   client.on("message", (m) => {

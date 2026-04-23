@@ -1,6 +1,7 @@
 // libsignal-client store implementations with optional file-backed
-// persistence. Pass a directory path to `createStores` to enable durability:
-// every mutation writes the affected map to its JSON file atomically.
+// persistence. Pass a directory path + encryption key to `createStores` to
+// enable durability: every mutation writes the affected map to its encrypted
+// `.enc` file atomically.
 import type { Uuid } from "@signalapp/libsignal-client";
 
 import {
@@ -32,6 +33,8 @@ import {
   SignedPreKeyStore,
 } from "@signalapp/libsignal-client";
 
+import { decryptBlob, encryptBlob } from "./crypto.ts";
+
 function key(addr: ProtocolAddress): string {
   return `${addr.name()}.${addr.deviceId()}`;
 }
@@ -41,13 +44,16 @@ function key(addr: ProtocolAddress): string {
 class PersistedBytesMap {
   private readonly data = new Map<string, Uint8Array>();
 
-  constructor(private readonly path?: string) {
+  constructor(
+    private readonly key: Uint8Array,
+    private readonly path?: string,
+  ) {
     if (!path || !existsSync(path)) return;
     try {
-      const obj = JSON.parse(readFileSync(path, "utf8")) as Record<
-        string,
-        string
-      >;
+      const raw = readFileSync(path);
+      const decrypted = decryptBlob(new Uint8Array(raw), key);
+      const json = Buffer.from(decrypted).toString("utf8");
+      const obj = JSON.parse(json) as Record<string, string>;
       for (const [k, v] of Object.entries(obj)) {
         this.data.set(k, Buffer.from(v, "base64"));
       }
@@ -87,8 +93,10 @@ class PersistedBytesMap {
       obj[k] = Buffer.from(v).toString("base64");
     }
     mkdirSync(dirname(this.path), { recursive: true });
+    const plaintext = Buffer.from(JSON.stringify(obj), "utf8");
+    const envelope = encryptBlob(plaintext, this.key);
     const tmp = this.path + ".tmp";
-    writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
+    writeFileSync(tmp, envelope, { mode: 0o600 });
     renameSync(tmp, this.path);
   }
 }
@@ -98,9 +106,9 @@ class PersistedBytesMap {
 export class InMemorySessionStore extends SessionStore {
   private readonly sessions: PersistedBytesMap;
 
-  constructor(path?: string) {
+  constructor(key: Uint8Array, path?: string) {
     super();
-    this.sessions = new PersistedBytesMap(path);
+    this.sessions = new PersistedBytesMap(key, path);
   }
 
   async saveSession(
@@ -134,10 +142,11 @@ export class InMemoryIdentityKeyStore extends IdentityKeyStore {
   constructor(
     private readonly identityKeyPrivate: PrivateKey,
     private readonly registrationId: number,
+    key: Uint8Array,
     path?: string,
   ) {
     super();
-    this.identities = new PersistedBytesMap(path);
+    this.identities = new PersistedBytesMap(key, path);
   }
 
   async getIdentityKey(): Promise<PrivateKey> {
@@ -183,9 +192,9 @@ export class InMemoryIdentityKeyStore extends IdentityKeyStore {
 export class InMemoryPreKeyStore extends PreKeyStore {
   private readonly keys: PersistedBytesMap;
 
-  constructor(path?: string) {
+  constructor(key: Uint8Array, path?: string) {
     super();
-    this.keys = new PersistedBytesMap(path);
+    this.keys = new PersistedBytesMap(key, path);
   }
 
   async savePreKey(id: number, record: PreKeyRecord): Promise<void> {
@@ -215,9 +224,9 @@ export class InMemoryPreKeyStore extends PreKeyStore {
 export class InMemorySignedPreKeyStore extends SignedPreKeyStore {
   private readonly keys: PersistedBytesMap;
 
-  constructor(path?: string) {
+  constructor(key: Uint8Array, path?: string) {
     super();
-    this.keys = new PersistedBytesMap(path);
+    this.keys = new PersistedBytesMap(key, path);
   }
 
   async saveSignedPreKey(
@@ -259,9 +268,9 @@ export class InMemoryKyberPreKeyStore extends KyberPreKeyStore {
   // "Used" state is in-memory only; libsignal never queries it back.
   private readonly used = new Set<number>();
 
-  constructor(path?: string) {
+  constructor(key: Uint8Array, path?: string) {
     super();
-    this.keys = new PersistedBytesMap(path);
+    this.keys = new PersistedBytesMap(key, path);
   }
 
   async saveKyberPreKey(id: number, record: KyberPreKeyRecord): Promise<void> {
@@ -305,9 +314,9 @@ export class InMemoryKyberPreKeyStore extends KyberPreKeyStore {
 export class InMemorySenderKeyStore extends SenderKeyStore {
   private readonly keys: PersistedBytesMap;
 
-  constructor(path?: string) {
+  constructor(key: Uint8Array, path?: string) {
     super();
-    this.keys = new PersistedBytesMap(path);
+    this.keys = new PersistedBytesMap(key, path);
   }
 
   // Key format: `${sender.name()}.${sender.deviceId()}|${distributionId}`
@@ -351,31 +360,33 @@ function storePaths(dir: string): {
   senderKeys: string;
 } {
   return {
-    sessions: join(dir, "sessions.json"),
-    identities: join(dir, "identities.json"),
-    preKeys: join(dir, "preKeys.json"),
-    signedPreKeys: join(dir, "signedPreKeys.json"),
-    kyberPreKeys: join(dir, "kyberPreKeys.json"),
-    senderKeys: join(dir, "senderKeys.json"),
+    sessions: join(dir, "sessions.enc"),
+    identities: join(dir, "identities.enc"),
+    preKeys: join(dir, "preKeys.enc"),
+    signedPreKeys: join(dir, "signedPreKeys.enc"),
+    kyberPreKeys: join(dir, "kyberPreKeys.enc"),
+    senderKeys: join(dir, "senderKeys.enc"),
   };
 }
 
 export function createStores(
   identityPrivate: PrivateKey,
   registrationId: number,
+  key: Uint8Array,
   persistDir?: string,
 ): ProtocolStores {
   const p = persistDir ? storePaths(persistDir) : undefined;
   return {
-    session: new InMemorySessionStore(p?.sessions),
+    session: new InMemorySessionStore(key, p?.sessions),
     identity: new InMemoryIdentityKeyStore(
       identityPrivate,
       registrationId,
+      key,
       p?.identities,
     ),
-    preKey: new InMemoryPreKeyStore(p?.preKeys),
-    signedPreKey: new InMemorySignedPreKeyStore(p?.signedPreKeys),
-    kyberPreKey: new InMemoryKyberPreKeyStore(p?.kyberPreKeys),
-    senderKey: new InMemorySenderKeyStore(p?.senderKeys),
+    preKey: new InMemoryPreKeyStore(key, p?.preKeys),
+    signedPreKey: new InMemorySignedPreKeyStore(key, p?.signedPreKeys),
+    kyberPreKey: new InMemoryKyberPreKeyStore(key, p?.kyberPreKeys),
+    senderKey: new InMemorySenderKeyStore(key, p?.senderKeys),
   };
 }
