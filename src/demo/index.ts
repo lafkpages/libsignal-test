@@ -17,10 +17,6 @@ import { SignalClient } from "../client.ts";
 import { parseContactDetailsStream } from "../contacts.ts";
 import { EnvelopeType, ReceiptType } from "../protos.ts";
 
-const DEVICE_NAME = `@luisafk/signal-client`;
-const STATE_FILE = "state.enc";
-const STORE_DIR = "store";
-
 // ---------- Pretty-printing helpers ----------
 
 function fmtTimestamp(ts: unknown): string {
@@ -169,9 +165,8 @@ async function main(): Promise<void> {
 
 async function runMain(): Promise<void> {
   const client = new SignalClient({
-    deviceName: DEVICE_NAME,
-    stateFile: STATE_FILE,
-    storeDir: STORE_DIR,
+    deviceName: `@luisafk/signal-client`,
+    storeDir: "store",
   });
 
   await client.init();
@@ -242,7 +237,7 @@ async function runMain(): Promise<void> {
       pni: state.pni,
       deviceId: state.deviceId,
     });
-    console.log(`Saved state to ${STATE_FILE}`);
+    console.log(`Saved state to`, client.config.storeDir);
 
     await client.connect();
 

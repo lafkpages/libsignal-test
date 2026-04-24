@@ -25,8 +25,8 @@ dist
 .DS_Store
 
 # Linked device secrets
-/state.enc
 /store/
+/store-*/
 
 # Generated
 /protos

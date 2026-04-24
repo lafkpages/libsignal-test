@@ -50,10 +50,7 @@ export interface SignalClientConfig {
   /** Device name, encrypted and registered with the server on link. */
   readonly deviceName: string;
 
-  /** Path to the JSON file holding linked-account state. */
-  readonly stateFile: string;
-
-  /** Directory holding sessions / identities / pre-keys (one JSON per kind). */
+  /** Directory holding sessions / identities / pre-keys (one JSON per kind), and the linked-account `state.enc` file. */
   readonly storeDir: string;
 
   /** libsignal Net environment. Defaults to Production. */
@@ -202,8 +199,10 @@ export class SignalClient {
   readonly config: Required<SignalClientConfig>;
   readonly net: Net.Net;
 
+  private readonly stateFile: string;
   private state: LinkedState | undefined;
   private stores: ProtocolStores | undefined;
+
   private authChat: Net.AuthenticatedChatConnection | undefined;
   private masterKey: Uint8Array | undefined;
 
@@ -230,6 +229,8 @@ export class SignalClient {
       env: this.config.env,
       userAgent: this.config.userAgent,
     });
+
+    this.stateFile = `${this.config.storeDir}/state.enc`;
   }
 
   /**
@@ -242,7 +243,7 @@ export class SignalClient {
     if (this.masterKey) return;
     this.masterKey = await getOrCreateMasterKey();
 
-    this.state = loadState(this.config.stateFile, this.masterKey);
+    this.state = loadState(this.stateFile, this.masterKey);
 
     if (this.state) {
       const identityPrivate = loadPrivateKey(this.state.aciIdentityPrivate);
@@ -272,7 +273,7 @@ export class SignalClient {
           signedPreKeyIdPni: randomInitialKeyId(),
           kyberPreKeyIdPni: randomInitialKeyId(),
         };
-        saveState(this.config.stateFile, this.state, this.masterKey);
+        saveState(this.stateFile, this.state, this.masterKey);
       }
     }
   }
@@ -552,7 +553,7 @@ export class SignalClient {
 
       keyIds,
     };
-    saveState(this.config.stateFile, state, masterKey);
+    saveState(this.stateFile, state, masterKey);
 
     this.state = state;
     this.stores = stores;
